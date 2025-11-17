@@ -151,6 +151,7 @@ class GeminiTransformer:
     def transform_thread(self, thread: SlackThread) -> KnowledgeEntry:
         user_prompt = (
             f"{SYSTEM_PROMPT}\n\n"
+            "Respond with ONLY valid minified JSON (no code fences, no commentary).\n"
             f"Slack thread from channel {thread.channel_id}:\n"
             f"{thread.as_prompt_block()}"
         )
@@ -159,7 +160,7 @@ class GeminiTransformer:
         except google_exceptions.GoogleAPIError as exc:
             raise RuntimeError(f"Gemini transformation failed: {exc}") from exc
 
-        text = (response.text or "").strip()
+        text = self._extract_json_text(response)
         if not text:
             raise RuntimeError("Gemini returned an empty response.")
         try:
@@ -180,6 +181,25 @@ class GeminiTransformer:
             source_channel=thread.channel_id,
             source_ts=thread.root_ts,
         )
+
+    @staticmethod
+    def _extract_json_text(response) -> str:
+        """Return raw JSON text, stripping common markdown fences."""
+        text = (response.text or "").strip()
+        if text.startswith("```"):
+            lines = text.splitlines()
+            # Remove opening fence
+            lines = lines[1:]
+            # Drop closing fence if present
+            if lines and lines[-1].strip().startswith("```"):
+                lines = lines[:-1]
+            text = "\n".join(lines).strip()
+
+        if "{" in text and "}" in text:
+            start = text.find("{")
+            end = text.rfind("}")
+            return text[start : end + 1]
+        return text
 
 
 class KnowledgeBaseLoader:
