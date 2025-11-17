@@ -149,17 +149,13 @@ class GeminiTransformer:
         self.model = genai.GenerativeModel(model_name)
 
     def transform_thread(self, thread: SlackThread) -> KnowledgeEntry:
-        content = [
-            {"role": "system", "parts": [SYSTEM_PROMPT]},
-            {
-                "role": "user",
-                "parts": [
-                    f"Slack thread from channel {thread.channel_id}:\n{thread.as_prompt_block()}"
-                ],
-            },
-        ]
+        user_prompt = (
+            f"{SYSTEM_PROMPT}\n\n"
+            f"Slack thread from channel {thread.channel_id}:\n"
+            f"{thread.as_prompt_block()}"
+        )
         try:
-            response = self.model.generate_content(content)
+            response = self.model.generate_content(user_prompt)
         except google_exceptions.GoogleAPIError as exc:
             raise RuntimeError(f"Gemini transformation failed: {exc}") from exc
 
