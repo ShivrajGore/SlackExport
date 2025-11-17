@@ -339,13 +339,9 @@ def main() -> None:
         nargs="+",
         help="Specific channel IDs to process. Defaults to all configured channels.",
     )
-    parser.add_argument(
-        "--credentials",
-        help="Optional path to the Firebase service account JSON file.",
-    )
     args = parser.parse_args()
 
-    store = FirestoreStore(credentials_path=args.credentials)
+    store = FirestoreStore()
     start_time = _parse_datetime(args.start)
     end_time = _parse_datetime(args.end)
 

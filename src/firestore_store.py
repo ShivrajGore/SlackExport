@@ -1,107 +1,75 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional
-
-import firebase_admin
-from firebase_admin import credentials, firestore
 
 from .models import AppConfig
 
-CONFIG_COLLECTION = "config"
-CONFIG_DOCUMENT = "settings"
-STATE_COLLECTION = "state"
-STATE_DOCUMENT = "last_run"
-LOG_COLLECTION = "logs"
 
+class LocalStore:
+    """
+    Lightweight file-based persistence layer that mirrors the Firestore
+    schema described in AGENT.md. Configuration, state, and logs are stored
+    under the `.data/` folder so the app can run without Firebase.
+    """
 
-class FirestoreStore:
-    """Wrapper around Firestore for storing config and application state."""
+    def __init__(self, base_dir: Optional[str] = None) -> None:
+        self.base_dir = Path(base_dir or ".data")
+        self.base_dir.mkdir(parents=True, exist_ok=True)
+        self.config_path = self.base_dir / "config.json"
+        self.state_path = self.base_dir / "state.json"
+        self.log_path = self.base_dir / "logs.json"
 
-    def __init__(self, credentials_path: Optional[str] = None) -> None:
-        if not firebase_admin._apps:
-            cred = self._load_credentials(credentials_path)
-            firebase_admin.initialize_app(cred)
-        self._client = firestore.client()
-
-    def _load_credentials(self, credentials_path: Optional[str]):
+    def _read_json(self, path: Path, default):
+        if not path.exists():
+            return default
         try:
-            if credentials_path:
-                return credentials.Certificate(credentials_path)
-            return credentials.ApplicationDefault()
-        except ValueError as exc:  # missing credentials or invalid file
-            raise RuntimeError(
-                "Firebase credentials not found. "
-                "Set GOOGLE_APPLICATION_CREDENTIALS or pass --credentials."
-            ) from exc
+            return json.loads(path.read_text())
+        except json.JSONDecodeError:
+            return default
+
+    def _write_json(self, path: Path, payload) -> None:
+        path.write_text(json.dumps(payload, indent=2))
 
     def fetch_config(self) -> AppConfig:
-        snapshot = (
-            self._client.collection(CONFIG_COLLECTION)
-            .document(CONFIG_DOCUMENT)
-            .get()
-        )
-        data = snapshot.to_dict() or {}
+        data = self._read_json(self.config_path, {})
         return AppConfig.from_dict(data)
 
     def save_config(self, config: AppConfig) -> None:
-        data = config.to_dict()
-        (
-            self._client.collection(CONFIG_COLLECTION)
-            .document(CONFIG_DOCUMENT)
-            .set(data)
-        )
+        self._write_json(self.config_path, config.to_dict())
 
     def fetch_last_run_ts(self) -> Optional[float]:
-        snapshot = (
-            self._client.collection(STATE_COLLECTION)
-            .document(STATE_DOCUMENT)
-            .get()
-        )
-        if not snapshot.exists:
-            return None
-        data = snapshot.to_dict() or {}
+        data = self._read_json(self.state_path, {})
         return data.get("timestamp")
 
     def update_last_run(self, timestamp: float) -> None:
-        document = {
+        payload = {
             "timestamp": timestamp,
             "date": datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat(),
         }
-        (
-            self._client.collection(STATE_COLLECTION)
-            .document(STATE_DOCUMENT)
-            .set(document)
-        )
+        self._write_json(self.state_path, payload)
 
     def append_log(
         self, status: str, details: str, channel: Optional[str] = None
     ) -> None:
-        payload = {
-            "timestamp": firestore.SERVER_TIMESTAMP,
-            "status": status,
-            "details": details,
-            "channel": channel,
-        }
-        self._client.collection(LOG_COLLECTION).add(payload)
+        logs = self._read_json(self.log_path, [])
+        logs.append(
+            {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "status": status,
+                "details": details,
+                "channel": channel or "",
+            }
+        )
+        self._write_json(self.log_path, logs)
 
     def fetch_logs(self, limit: int = 50) -> List[Dict[str, Any]]:
-        query = (
-            self._client.collection(LOG_COLLECTION)
-            .order_by("timestamp", direction=firestore.Query.DESCENDING)
-            .limit(limit)
-        )
-        snapshots = query.stream()
-        logs: List[Dict[str, Any]] = []
-        for snap in snapshots:
-            data = snap.to_dict()
-            ts = data.get("timestamp")
-            logs.append(
-                {
-                    "timestamp": ts.isoformat() if ts else "",
-                    "status": data.get("status", ""),
-                    "details": data.get("details", ""),
-                    "channel": data.get("channel", ""),
-                }
-            )
-        return logs
+        logs = self._read_json(self.log_path, [])
+        logs.sort(key=lambda item: item.get("timestamp", ""), reverse=True)
+        return logs[:limit]
+
+
+# Backwards compatibility with existing imports
+FirestoreStore = LocalStore

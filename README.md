@@ -5,7 +5,7 @@ Implements the ETL workflow described in `AGENT.md`. The agent extracts Slack th
 ## Project Layout
 
 - `src/slack_etl.py` – pipeline entrypoint and CLI for scheduled runs.
-- `src/firestore_store.py` – persistence layer for configuration, state, and logs in Firestore.
+- `src/firestore_store.py` – lightweight local persistence layer for configuration, state, and logs (stored in `.data/`).
 - `src/models.py` – strongly typed dataclasses shared across components.
 - `streamlit_app.py` – Streamlit dashboard for configuration management, manual exports, and log visibility.
 - `knowledge_base/` – destination folder for generated Markdown files.
@@ -17,8 +17,17 @@ Implements the ETL workflow described in `AGENT.md`. The agent extracts Slack th
    ```bash
    pip install -r requirements.txt
    ```
-3. Firebase credentials exposed through `GOOGLE_APPLICATION_CREDENTIALS` or passed via `--credentials` to the CLI/Streamlit app.
-4. Firestore collections matching the design in `AGENT.md` (`config/settings`, `state/last_run`, `logs/*`).
+3. Write access to the project directory so the app can create the `.data/` folder (config/state/log storage) and `knowledge_base/` output files.
+
+## Local Persistence
+
+When you interact with the Streamlit dashboard or CLI, the shared state lives in `.data/`:
+
+- `.data/config.json` – Slack token, Gemini key, channel IDs, knowledge base directory, Gemini model.
+- `.data/state.json` – timestamp of the last successful incremental run.
+- `.data/logs.json` – append-only record of pipeline executions displayed in the Streamlit log table.
+
+These files are created automatically on first run. Add `.data/` to `.gitignore` if you do not want to commit secrets or run history.
 
 ## Running the Pipeline
 
@@ -31,7 +40,7 @@ python -m src.slack_etl \
   --channels C01ABCD1234 C01EFGH5678
 ```
 
-Omit `--start`/`--end` for incremental runs that use the timestamp stored in Firestore. Only on successful incremental runs does the script update `/state/last_run`.
+Omit `--start`/`--end` for incremental runs that use the timestamp stored in `.data/state.json`. Only on successful incremental runs does the script update that timestamp.
 
 ### Streamlit Dashboard
 
@@ -43,7 +52,7 @@ Features:
 
 - Manage Slack token, Gemini API key, monitored channels, output directory, and model selection.
 - Trigger incremental exports or manual exports constrained by custom date ranges.
-- View Firestore-backed execution logs.
+- View the locally persisted execution logs (`.data/logs.json`).
 
 ## Knowledge Base Output
 
@@ -54,4 +63,3 @@ Each exported thread yields a Markdown file with three sections:
 3. **Findings & Lessons Learned**
 
 File names are derived from the channel ID and root timestamp, ensuring unique, easily traceable entries inside `knowledge_base/`.
-
