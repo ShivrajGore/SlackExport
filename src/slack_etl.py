@@ -327,6 +327,7 @@ def run_pipeline(
         "manual_range": manual_range,
         "start_timestamp": oldest,
         "end_timestamp": latest,
+        "output_dir": str(loader.output_dir.resolve()),
     }
 
 
