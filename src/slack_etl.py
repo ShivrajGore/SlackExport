@@ -186,6 +186,7 @@ def _transcript_fallback_entry(
         findings=findings_text,
         source_channel=thread.channel_id,
         source_ts=thread.root_ts,
+        conversation=thread.as_prompt_block(),
     )
 
 
