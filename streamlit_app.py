@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from datetime import date, datetime, time as dt_time, timezone
-from typing import List
+from io import BytesIO
+from pathlib import Path
+from typing import List, Optional, Tuple
+import zipfile
 
 import streamlit as st
 
@@ -66,6 +69,22 @@ def render_logs(store: FirestoreStore) -> None:
         st.info("No logs recorded yet.")
         return
     st.dataframe(logs, use_container_width=True)
+
+
+def build_download_bundle(output_dir: str) -> Optional[Tuple[bytes, str]]:
+    base_path = Path(output_dir)
+    if not base_path.exists():
+        return None
+    files = [path for path in base_path.rglob("*") if path.is_file()]
+    if not files:
+        return None
+    buffer = BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for file_path in files:
+            archive.write(file_path, arcname=str(file_path.relative_to(base_path)))
+    buffer.seek(0)
+    filename = f"slack_export_{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}.zip"
+    return buffer.getvalue(), filename
 
 
 def main() -> None:
@@ -136,7 +155,19 @@ def main() -> None:
         level, message = status
         getattr(st, level)(message)
     if st.session_state.get("last_result"):
-        st.json(st.session_state["last_result"])
+        last_result = st.session_state["last_result"]
+        st.json(last_result)
+        bundle = build_download_bundle(last_result["output_dir"])
+        if bundle:
+            content, filename = bundle
+            st.download_button(
+                "Download Exported Threads",
+                data=content,
+                file_name=filename,
+                mime="application/zip",
+            )
+        else:
+            st.caption("No exported files found to download yet.")
 
     st.subheader("Execution Logs")
     render_logs(store)
