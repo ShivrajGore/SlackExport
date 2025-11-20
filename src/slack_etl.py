@@ -35,6 +35,29 @@ def _format_timestamp(value: float) -> str:
     return f"{value:.6f}"
 
 
+PLACEHOLDER_RESPONSES = {
+    "not documented",
+    "not provided",
+    "not specified",
+    "n/a",
+    "na",
+    "unknown",
+    "not available",
+}
+
+
+def _normalize_response_field(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, (list, tuple)):
+        parts = [_normalize_response_field(item) for item in value]
+        joined = "\n".join(part for part in parts if part)
+        return joined.strip()
+    return str(value).strip()
+
+
 class SlackExtractor:
     """Fetches Slack messages and threads incrementally."""
 
@@ -168,11 +191,29 @@ class GeminiTransformer:
         except json.JSONDecodeError:
             raise RuntimeError("Gemini response could not be parsed as JSON.")
 
-        issue = payload.get("issue_description") or payload.get("issue") or ""
-        resolution = payload.get("resolution_fix") or payload.get("resolution") or ""
-        findings = payload.get("findings_lessons") or payload.get("findings") or ""
-        if not any([issue, resolution, findings]):
-            raise RuntimeError("Gemini response missing required fields.")
+        issue = _normalize_response_field(
+            payload.get("issue_description") or payload.get("issue")
+        )
+        resolution = _normalize_response_field(
+            payload.get("resolution_fix") or payload.get("resolution")
+        )
+        findings = _normalize_response_field(
+            payload.get("findings_lessons") or payload.get("findings")
+        )
+        issue = "" if issue.lower() in PLACEHOLDER_RESPONSES else issue
+        resolution = "" if resolution.lower() in PLACEHOLDER_RESPONSES else resolution
+        findings = "" if findings.lower() in PLACEHOLDER_RESPONSES else findings
+        missing_sections = []
+        if not issue:
+            missing_sections.append("issue description")
+        if not resolution:
+            missing_sections.append("resolution/fix")
+        if not findings:
+            missing_sections.append("findings/lessons")
+        if missing_sections:
+            raise RuntimeError(
+                f"Gemini response missing required fields: {', '.join(missing_sections)}"
+            )
 
         return KnowledgeEntry(
             issue_description=issue.strip(),
