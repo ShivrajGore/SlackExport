@@ -165,63 +165,88 @@ class SlackExtractor:
 class GeminiTransformer:
     """Calls Gemini to transform a Slack thread into a structured knowledge entry."""
 
-    def __init__(self, api_key: str, model_name: str) -> None:
+    def __init__(self, api_key: str, model_name: str, max_attempts: int = 2) -> None:
         if not api_key:
             raise ValueError("Gemini API key missing from configuration.")
         genai.configure(api_key=api_key)
         self.model = genai.GenerativeModel(model_name)
+        self.max_attempts = max(1, max_attempts)
 
-    def transform_thread(self, thread: SlackThread) -> KnowledgeEntry:
-        user_prompt = (
+    def _build_prompt(
+        self, thread: SlackThread, missing_sections: Optional[List[str]] = None
+    ) -> str:
+        reminder = ""
+        if missing_sections:
+            missing_text = ", ".join(missing_sections)
+            reminder = (
+                "\n\nPrevious response omitted required sections. "
+                f"Ensure the following sections contain actionable content: {missing_text}. "
+                "Summarize concisely even if the thread is sparse."
+            )
+        return (
             f"{SYSTEM_PROMPT}\n\n"
             "Respond with ONLY valid minified JSON (no code fences, no commentary).\n"
             f"Slack thread from channel {thread.channel_id}:\n"
             f"{thread.as_prompt_block()}"
+            f"{reminder}"
         )
-        try:
-            response = self.model.generate_content(user_prompt)
-        except google_exceptions.GoogleAPIError as exc:
-            raise RuntimeError(f"Gemini transformation failed: {exc}") from exc
 
-        text = self._extract_json_text(response)
-        if not text:
-            raise RuntimeError("Gemini returned an empty response.")
-        try:
-            payload = json.loads(text)
-        except json.JSONDecodeError:
-            raise RuntimeError("Gemini response could not be parsed as JSON.")
+    def transform_thread(self, thread: SlackThread) -> KnowledgeEntry:
+        missing_sections: List[str] = []
+        last_error: Optional[str] = None
+        for attempt in range(self.max_attempts):
+            user_prompt = self._build_prompt(thread, missing_sections=missing_sections or None)
+            try:
+                response = self.model.generate_content(user_prompt)
+            except google_exceptions.GoogleAPIError as exc:
+                last_error = str(exc)
+                continue
 
-        issue = _normalize_response_field(
-            payload.get("issue_description") or payload.get("issue")
-        )
-        resolution = _normalize_response_field(
-            payload.get("resolution_fix") or payload.get("resolution")
-        )
-        findings = _normalize_response_field(
-            payload.get("findings_lessons") or payload.get("findings")
-        )
-        issue = "" if issue.lower() in PLACEHOLDER_RESPONSES else issue
-        resolution = "" if resolution.lower() in PLACEHOLDER_RESPONSES else resolution
-        findings = "" if findings.lower() in PLACEHOLDER_RESPONSES else findings
-        missing_sections = []
-        if not issue:
-            missing_sections.append("issue description")
-        if not resolution:
-            missing_sections.append("resolution/fix")
-        if not findings:
-            missing_sections.append("findings/lessons")
-        if missing_sections:
-            raise RuntimeError(
-                f"Gemini response missing required fields: {', '.join(missing_sections)}"
+            text = self._extract_json_text(response)
+            if not text:
+                last_error = "Gemini returned an empty response."
+                continue
+            try:
+                payload = json.loads(text)
+            except json.JSONDecodeError:
+                last_error = "Gemini response could not be parsed as JSON."
+                continue
+
+            issue = _normalize_response_field(
+                payload.get("issue_description") or payload.get("issue")
+            )
+            resolution = _normalize_response_field(
+                payload.get("resolution_fix") or payload.get("resolution")
+            )
+            findings = _normalize_response_field(
+                payload.get("findings_lessons") or payload.get("findings")
+            )
+            issue = "" if issue.lower() in PLACEHOLDER_RESPONSES else issue
+            resolution = "" if resolution.lower() in PLACEHOLDER_RESPONSES else resolution
+            findings = "" if findings.lower() in PLACEHOLDER_RESPONSES else findings
+            missing_sections = []
+            if not issue:
+                missing_sections.append("issue description")
+            if not resolution:
+                missing_sections.append("resolution/fix")
+            if not findings:
+                missing_sections.append("findings/lessons")
+            if missing_sections:
+                last_error = (
+                    "Gemini response missing required fields: "
+                    f"{', '.join(missing_sections)}"
+                )
+                continue
+
+            return KnowledgeEntry(
+                issue_description=issue.strip(),
+                resolution=resolution.strip(),
+                findings=findings.strip(),
+                source_channel=thread.channel_id,
+                source_ts=thread.root_ts,
             )
 
-        return KnowledgeEntry(
-            issue_description=issue.strip(),
-            resolution=resolution.strip(),
-            findings=findings.strip(),
-            source_channel=thread.channel_id,
-            source_ts=thread.root_ts,
-        )
+        raise RuntimeError(last_error or "Gemini transformation failed.")
 
     @staticmethod
     def _extract_json_text(response) -> str:
