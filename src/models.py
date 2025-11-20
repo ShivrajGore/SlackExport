@@ -66,4 +66,4 @@ class KnowledgeEntry:
     source_channel: str
     source_ts: str
     file_path: Optional[Path] = None
-
+    conversation: str = ""

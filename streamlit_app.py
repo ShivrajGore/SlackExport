@@ -168,8 +168,15 @@ def main() -> None:
             )
         else:
             st.caption("No exported files found to download yet.")
-        st.metric("Raw Threads", last_result.get("raw_threads", 0))
-        st.metric("Summaries", last_result.get("threads_summarized", 0))
+        st.metric("Threads Exported", last_result.get("threads_exported", 0))
+        st.metric("LLM Summaries", last_result.get("summaries_generated", 0))
+        st.metric("Transcript Fallbacks", last_result.get("summaries_fallback", 0))
+        st.metric("Embedding Chunks", last_result.get("embedding_records", 0))
+        summary_issues = last_result.get("summary_issues") or []
+        if summary_issues:
+            with st.expander("Summaries that fell back to raw transcript"):
+                for issue in summary_issues:
+                    st.write(f"- {issue}")
 
     st.subheader("Execution Logs")
     render_logs(store)

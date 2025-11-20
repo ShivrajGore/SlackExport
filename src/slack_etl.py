@@ -15,9 +15,9 @@ from google.api_core import exceptions as google_exceptions
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 
+from .embedding_store import EmbeddingWriter
 from .firestore_store import FirestoreStore
 from .models import AppConfig, KnowledgeEntry, SlackMessage, SlackThread
-from .thread_exporter import RawThreadExporter
 
 logger = logging.getLogger(__name__)
 
@@ -163,6 +163,32 @@ class SlackExtractor:
         )
 
 
+def _conversation_summary(thread: SlackThread) -> str:
+    if not thread.messages:
+        return "Conversation transcript unavailable."
+    first = thread.messages[0].text.strip()
+    return first or "Conversation transcript captured below."
+
+
+def _transcript_fallback_entry(
+    thread: SlackThread,
+    issue: str = "",
+    resolution: str = "",
+    findings: str = "",
+) -> KnowledgeEntry:
+    issue_text = issue or _conversation_summary(thread)
+    default_text = "See conversation transcript for details."
+    resolution_text = resolution or default_text
+    findings_text = findings or default_text
+    return KnowledgeEntry(
+        issue_description=issue_text,
+        resolution=resolution_text,
+        findings=findings_text,
+        source_channel=thread.channel_id,
+        source_ts=thread.root_ts,
+    )
+
+
 class GeminiTransformer:
     """Calls Gemini to transform a Slack thread into a structured knowledge entry."""
 
@@ -193,10 +219,13 @@ class GeminiTransformer:
         )
 
     def transform_thread(self, thread: SlackThread) -> KnowledgeEntry:
-        missing_sections: List[str] = []
+        pending_sections: List[str] = []
         last_error: Optional[str] = None
+        last_payload: Optional[tuple[str, str, str]] = None
         for attempt in range(self.max_attempts):
-            user_prompt = self._build_prompt(thread, missing_sections=missing_sections or None)
+            user_prompt = self._build_prompt(
+                thread, missing_sections=pending_sections or None
+            )
             try:
                 response = self.model.generate_content(user_prompt)
             except google_exceptions.GoogleAPIError as exc:
@@ -225,26 +254,42 @@ class GeminiTransformer:
             issue = "" if issue.lower() in PLACEHOLDER_RESPONSES else issue
             resolution = "" if resolution.lower() in PLACEHOLDER_RESPONSES else resolution
             findings = "" if findings.lower() in PLACEHOLDER_RESPONSES else findings
-            missing_sections = []
+            pending_sections = []
             if not issue:
-                missing_sections.append("issue description")
+                pending_sections.append("issue description")
             if not resolution:
-                missing_sections.append("resolution/fix")
+                pending_sections.append("resolution/fix")
             if not findings:
-                missing_sections.append("findings/lessons")
-            if missing_sections:
+                pending_sections.append("findings/lessons")
+            last_payload = (issue, resolution, findings)
+            if pending_sections:
                 last_error = (
                     "Gemini response missing required fields: "
-                    f"{', '.join(missing_sections)}"
+                    f"{', '.join(pending_sections)}"
                 )
                 continue
 
-            return KnowledgeEntry(
+            entry = KnowledgeEntry(
                 issue_description=issue.strip(),
                 resolution=resolution.strip(),
                 findings=findings.strip(),
                 source_channel=thread.channel_id,
                 source_ts=thread.root_ts,
+            )
+            return entry
+
+        if last_payload:
+            issue, resolution, findings = last_payload
+            logger.warning(
+                "Gemini summary incomplete for thread %s: %s. Falling back to transcript context.",
+                thread.root_ts,
+                ", ".join(pending_sections) if pending_sections else "unknown issue",
+            )
+            return _transcript_fallback_entry(
+                thread,
+                issue=issue.strip(),
+                resolution=resolution.strip(),
+                findings=findings.strip(),
             )
 
         raise RuntimeError(last_error or "Gemini transformation failed.")
@@ -290,12 +335,35 @@ class KnowledgeBaseLoader:
 
     @staticmethod
     def _render_markdown(entry: KnowledgeEntry) -> str:
+        conversation_block = ""
+        if entry.conversation:
+            conversation_block = (
+                "\n## Conversation Transcript\n```\n"
+                f"{entry.conversation.strip()}\n"
+                "```"
+            )
         return (
-            f"# Issue Description\n{entry.issue_description.strip()}\n\n"
-            f"## Resolution / Fix\n{entry.resolution.strip()}\n\n"
-            f"## Findings & Lessons Learned\n{entry.findings.strip()}\n\n"
+            f"# Issue Description\n{entry.issue_description.strip() or 'See conversation transcript below.'}\n\n"
+            f"## Resolution / Fix\n{entry.resolution.strip() or 'See conversation transcript below.'}\n\n"
+            f"## Findings & Lessons Learned\n{entry.findings.strip() or 'See conversation transcript below.'}\n\n"
             f"*Source: channel {entry.source_channel} at {entry.source_ts}*"
+            f"{conversation_block}"
         )
+
+
+def _build_embedding_text(entry: KnowledgeEntry, fallback: bool) -> str:
+    parts = [
+        f"Issue: {entry.issue_description.strip()}",
+        f"Resolution: {entry.resolution.strip()}",
+        f"Findings: {entry.findings.strip()}",
+    ]
+    if fallback:
+        parts.append("Summary derived from transcript fallback.")
+    if entry.conversation:
+        snippet_lines = entry.conversation.splitlines()
+        snippet = "\n".join(snippet_lines[: min(len(snippet_lines), 8)])
+        parts.append(f"Conversation excerpt:\n{snippet}")
+    return "\n".join(part for part in parts if part).strip()
 
 
 def _validate_config(config: AppConfig) -> None:
@@ -346,14 +414,20 @@ def run_pipeline(
 
     extractor = SlackExtractor(config.slack_token)
     transformer = GeminiTransformer(config.gemini_key, config.gemini_model)
-    raw_exporter = RawThreadExporter(Path(config.knowledge_base_dir) / "raw_threads")
     loader = KnowledgeBaseLoader(config.knowledge_base_dir)
+    embeddings_path = (
+        Path(config.knowledge_base_dir) / "embeddings" / "threads.jsonl"
+    )
+    embedding_writer = EmbeddingWriter(embeddings_path)
 
     channels = list(channel_filter) if channel_filter else config.channel_ids
-    raw_exported = 0
-    summarized = 0
+    exported = 0
+    summaries_generated = 0
+    summaries_fallback = 0
     failures: List[str] = []
+    summary_issues: List[str] = []
     channel_stats: dict[str, int] = {channel: 0 for channel in channels}
+    embedding_records = 0
 
     for channel_id in channels:
         try:
@@ -367,20 +441,33 @@ def run_pipeline(
             logger.info("No new threads for channel %s", channel_id)
             continue
         for thread in threads:
-            raw_path = raw_exporter.save(thread)
-            raw_exported += 1
+            fallback_used = False
             try:
                 entry = transformer.transform_thread(thread)
-                loader.save_entry(entry)
-                summarized += 1
-                channel_stats[channel_id] = channel_stats.get(channel_id, 0) + 1
+                summaries_generated += 1
             except Exception as exc:  # pylint: disable=broad-except
-                error_msg = (
-                    f"Thread {thread.root_ts} failed to summarize: {exc}. "
-                    f"Raw transcript saved at {raw_path}"
+                warning = (
+                    f"Thread {thread.root_ts} fell back to transcript summary due to: {exc}"
                 )
-                logger.exception(error_msg)
-                failures.append(error_msg)
+                logger.warning(warning)
+                summary_issues.append(warning)
+                entry = _transcript_fallback_entry(thread)
+                summaries_fallback += 1
+                fallback_used = True
+            entry.conversation = thread.as_prompt_block()
+            loader.save_entry(entry)
+            exported += 1
+            channel_stats[channel_id] = channel_stats.get(channel_id, 0) + 1
+            embedding_writer.append(
+                {
+                    "id": f"{entry.source_channel}-{entry.source_ts}",
+                    "channel_id": entry.source_channel,
+                    "root_ts": entry.source_ts,
+                    "fallback": fallback_used,
+                    "text": _build_embedding_text(entry, fallback=fallback_used),
+                }
+            )
+            embedding_records += 1
 
     if not manual_range and not failures:
         store.update_last_run(time.time())
@@ -388,18 +475,23 @@ def run_pipeline(
     status = "SUCCESS" if not failures else "FAILURE"
     details = (
         f"Channels: {', '.join(channels)} | "
-        f"Raw threads: {raw_exported} | "
-        f"Summaries: {summarized} | "
+        f"Threads exported: {exported} | "
+        f"LLM summaries: {summaries_generated} | "
+        f"Transcript fallbacks: {summaries_fallback} | "
+        f"Embedding chunks: {embedding_records} | "
         f"Errors: {len(failures)}"
     )
     store.append_log(status=status, details=details)
 
     return {
         "channels_scanned": len(channels),
-        "raw_threads": raw_exported,
-        "threads_summarized": summarized,
+        "threads_exported": exported,
+        "summaries_generated": summaries_generated,
+        "summaries_fallback": summaries_fallback,
+        "embedding_records": embedding_records,
         "channel_stats": channel_stats,
         "failures": failures,
+        "summary_issues": summary_issues,
         "manual_range": manual_range,
         "start_timestamp": oldest,
         "end_timestamp": latest,
