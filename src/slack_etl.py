@@ -17,6 +17,7 @@ from slack_sdk.errors import SlackApiError
 
 from .firestore_store import FirestoreStore
 from .models import AppConfig, KnowledgeEntry, SlackMessage, SlackThread
+from .thread_exporter import RawThreadExporter
 
 logger = logging.getLogger(__name__)
 
@@ -345,10 +346,12 @@ def run_pipeline(
 
     extractor = SlackExtractor(config.slack_token)
     transformer = GeminiTransformer(config.gemini_key, config.gemini_model)
+    raw_exporter = RawThreadExporter(Path(config.knowledge_base_dir) / "raw_threads")
     loader = KnowledgeBaseLoader(config.knowledge_base_dir)
 
     channels = list(channel_filter) if channel_filter else config.channel_ids
-    exported = 0
+    raw_exported = 0
+    summarized = 0
     failures: List[str] = []
     channel_stats: dict[str, int] = {channel: 0 for channel in channels}
 
@@ -364,13 +367,18 @@ def run_pipeline(
             logger.info("No new threads for channel %s", channel_id)
             continue
         for thread in threads:
+            raw_path = raw_exporter.save(thread)
+            raw_exported += 1
             try:
                 entry = transformer.transform_thread(thread)
                 loader.save_entry(entry)
-                exported += 1
+                summarized += 1
                 channel_stats[channel_id] = channel_stats.get(channel_id, 0) + 1
             except Exception as exc:  # pylint: disable=broad-except
-                error_msg = f"Thread {thread.root_ts} failed: {exc}"
+                error_msg = (
+                    f"Thread {thread.root_ts} failed to summarize: {exc}. "
+                    f"Raw transcript saved at {raw_path}"
+                )
                 logger.exception(error_msg)
                 failures.append(error_msg)
 
@@ -380,14 +388,16 @@ def run_pipeline(
     status = "SUCCESS" if not failures else "FAILURE"
     details = (
         f"Channels: {', '.join(channels)} | "
-        f"Threads exported: {exported} | "
+        f"Raw threads: {raw_exported} | "
+        f"Summaries: {summarized} | "
         f"Errors: {len(failures)}"
     )
     store.append_log(status=status, details=details)
 
     return {
         "channels_scanned": len(channels),
-        "threads_exported": exported,
+        "raw_threads": raw_exported,
+        "threads_summarized": summarized,
         "channel_stats": channel_stats,
         "failures": failures,
         "manual_range": manual_range,

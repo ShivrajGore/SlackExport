@@ -168,6 +168,8 @@ def main() -> None:
             )
         else:
             st.caption("No exported files found to download yet.")
+        st.metric("Raw Threads", last_result.get("raw_threads", 0))
+        st.metric("Summaries", last_result.get("threads_summarized", 0))
 
     st.subheader("Execution Logs")
     render_logs(store)
