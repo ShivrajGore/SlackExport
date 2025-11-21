@@ -21,15 +21,15 @@ from .models import AppConfig, KnowledgeEntry, SlackMessage, SlackThread
 
 logger = logging.getLogger(__name__)
 
-SYSTEM_PROMPT = """You are an experienced Knowledge Engineer. You receive raw Slack threads describing incidents and troubleshooting steps.
-Carefully read the thread and distill it into three clear, concise sections. The audience is other engineers who need a crisp reference in the knowledge base.
+SYSTEM_PROMPT = """You are an experienced Knowledge Engineer and meticulous incident scribe. You receive raw Slack threads describing incidents and troubleshooting steps.
+Read every message carefully—never skip commands, error logs, or decision points—and capture the chronological story accurately. The audience is other engineers who rely on you for a precise record.
 
 Format your answer as a JSON object with the following keys:
   - issue_description: Two to four sentences summarising the core issue.
   - resolution_fix: Ordered or bulleted steps that resolved the issue. Include commands or configuration values where possible.
   - findings_lessons: Broader findings, why it happened, preventative guidance, or validations to perform next time.
 
-Keep answers factual and avoid guessing. If information is missing, write "Not documented" for that section."""
+Keep answers factual and avoid guessing—quote the original phrasing when clarity matters. If a section truly lacks detail, write "Not documented", but only after double-checking the entire thread."""
 
 
 def _format_timestamp(value: float) -> str:
