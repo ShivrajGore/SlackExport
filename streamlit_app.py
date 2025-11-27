@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date, datetime, time as dt_time, timezone
+from datetime import date, datetime, time as dt_time, timedelta
 from io import BytesIO
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -13,6 +13,7 @@ from src.models import AppConfig
 from src.slack_etl import run_pipeline
 
 st.set_page_config(page_title="Slack Knowledge Export", layout="wide")
+LOCAL_TZ = datetime.now().astimezone().tzinfo
 
 
 def get_store() -> FirestoreStore:
@@ -38,9 +39,11 @@ def parse_channels(raw_value: str) -> List[str]:
 
 
 def combine_date(date_value: date, end_of_day: bool = False) -> datetime:
-    base_time = dt_time.max if end_of_day else dt_time.min
-    dt = datetime.combine(date_value, base_time)
-    return dt.replace(tzinfo=timezone.utc)
+    tz = LOCAL_TZ or datetime.now().astimezone().tzinfo
+    if end_of_day:
+        date_value = date_value + timedelta(days=1)
+    dt = datetime.combine(date_value, dt_time.min, tzinfo=tz)
+    return dt
 
 
 def trigger_pipeline(store: FirestoreStore, start_dt=None, end_dt=None) -> None:
