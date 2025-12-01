@@ -12,8 +12,8 @@ class AppConfig:
 
     slack_token: str
     gemini_key: str
-    openai_api_key: str = ""
     channel_ids: List[str]
+    openai_api_key: str = ""
     knowledge_base_dir: str = "knowledge_base"
     gemini_model: str = "gemini-1.5-pro-latest"
     openai_model: str = "gpt-4o-mini"
