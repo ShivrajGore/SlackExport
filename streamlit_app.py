@@ -12,8 +12,79 @@ from src.firestore_store import FirestoreStore
 from src.models import AppConfig
 from src.slack_etl import run_pipeline
 
-st.set_page_config(page_title="Slack Knowledge Export", layout="wide")
+st.set_page_config(
+    page_title="Slack Knowledge Export",
+    layout="wide",
+    page_icon=":robot_face:",
+)
 LOCAL_TZ = datetime.now().astimezone().tzinfo
+
+PRIMARY = "#5C6CFF"
+SECONDARY = "#1C1F33"
+ACCENT = "#22D3EE"
+CARD_BG = "#14172B"
+TEXT_LIGHT = "#F5F7FF"
+
+
+def inject_theme() -> None:
+    st.markdown(
+        f"""
+        <style>
+            .stApp {{
+                background: radial-gradient(circle at top, #12172b 0%, #080912 45%, #05060f 100%);
+                color: {TEXT_LIGHT};
+                font-family: 'Inter', 'Segoe UI', system-ui, sans-serif;
+            }}
+            h1, h2, h3, h4, h5, h6, .stMetric label {{
+                color: {TEXT_LIGHT};
+            }}
+            .custom-card {{
+                border-radius: 18px;
+                padding: 1.25rem 1.5rem;
+                background: {CARD_BG};
+                border: 1px solid rgba(255,255,255,0.05);
+                box-shadow: 0 20px 45px rgba(0,0,0,0.35);
+            }}
+            .stButton>button {{
+                background: linear-gradient(120deg, {PRIMARY}, {ACCENT});
+                color: white;
+                border: none;
+                border-radius: 999px;
+                padding: 0.6rem 1.4rem;
+                font-weight: 600;
+                box-shadow: 0 10px 25px rgba(92,108,255,0.3);
+            }}
+            .stButton>button:disabled {{
+                background: rgba(255,255,255,0.1);
+                color: rgba(255,255,255,0.6);
+            }}
+            .css-1dp5vir, .css-1cypcdb, .st-emotion-cache-1r6slb0 {{
+                background: transparent;
+            }}
+            .metric-card {{
+                border-radius: 16px;
+                background: rgba(255,255,255,0.03);
+                padding: 1rem 1.2rem;
+                border: 1px solid rgba(255,255,255,0.05);
+            }}
+            .metric-value {{
+                font-size: 2rem;
+                font-weight: 700;
+                color: {ACCENT};
+            }}
+            .metric-label {{
+                font-size: 0.9rem;
+                letter-spacing: 0.05em;
+                text-transform: uppercase;
+                color: rgba(255,255,255,0.7);
+            }}
+            .stDataFrame thead {{
+                background: rgba(255,255,255,0.04);
+            }}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def get_store() -> FirestoreStore:
@@ -90,28 +161,78 @@ def build_download_bundle(output_dir: str) -> Optional[Tuple[bytes, str]]:
     return buffer.getvalue(), filename
 
 
+def render_metrics(last_result: dict) -> None:
+    metrics = [
+        ("Threads Exported", last_result.get("threads_exported", 0)),
+        ("LLM Summaries", last_result.get("summaries_generated", 0)),
+        ("Transcript Fallbacks", last_result.get("summaries_fallback", 0)),
+        ("Embedding Chunks", last_result.get("embedding_records", 0)),
+    ]
+    cols = st.columns(len(metrics))
+    for (label, value), col in zip(metrics, cols):
+        with col:
+            st.markdown(
+                f"""
+                <div class="metric-card">
+                    <div class="metric-label">{label}</div>
+                    <div class="metric-value">{value}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+
 def main() -> None:
+    inject_theme()
     store = get_store()
     config = load_config(store)
 
-    st.title("Slack Knowledge Base Exporter")
-    st.caption("Incrementally export Slack knowledge into clean Markdown entries.")
+    st.markdown(
+        """
+        <div class="custom-card">
+            <h1 style="margin-bottom:0.3rem;">Slack Knowledge Pilot</h1>
+            <p style="margin-top:0; color: rgba(245,247,255,0.75);">
+                Seamlessly distill Slack incidents into CustomGPT-ready knowledge.
+                Tag threads, export transcripts, and keep your AI agents current.
+            </p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
-    with st.sidebar:
-        st.header("Configuration")
+    with st.container():
+        st.markdown('<div class="custom-card">', unsafe_allow_html=True)
+        st.subheader("Control Center", divider="rainbow")
+        col1, col2 = st.columns([1, 1])
+        with col1:
+            if st.button(
+                "⚡ Run Incremental Export",
+                use_container_width=True,
+                disabled=st.session_state.get("is_exporting", False),
+            ):
+                trigger_pipeline(store)
+        with col2:
+            today = date.today()
+            default_start = today
+            start_date = st.date_input("Start Date", value=default_start)
+            end_date = st.date_input("End Date", value=today)
+            if st.button(
+                "📅 Run Manual Export",
+                use_container_width=True,
+                disabled=st.session_state.get("is_exporting", False),
+            ):
+                start_dt = combine_date(start_date, end_of_day=False)
+                end_dt = combine_date(end_date, end_of_day=True)
+                trigger_pipeline(store, start_dt=start_dt, end_dt=end_dt)
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    with st.expander("Configuration", expanded=False):
+        st.markdown(
+            "Use your OpenAI enterprise key as the primary summarizer. Gemini remains a secondary fallback."
+        )
         slack_token = st.text_input(
             "Slack Bot Token",
             value=config.slack_token,
-            type="password",
-        )
-        gemini_key = st.text_input(
-            "Gemini API Key",
-            value=config.gemini_key,
-            type="password",
-        )
-        openai_key = st.text_input(
-            "OpenAI API Key",
-            value=config.openai_api_key,
             type="password",
         )
         channels_raw = st.text_area(
@@ -122,16 +243,25 @@ def main() -> None:
             "Knowledge Base Directory",
             value=config.knowledge_base_dir,
         )
-        gemini_model = st.text_input(
-            "Gemini Model",
-            value=config.gemini_model,
+        openai_key = st.text_input(
+            "OpenAI API Key",
+            value=config.openai_api_key,
+            type="password",
         )
         openai_model = st.text_input(
             "OpenAI Model",
             value=config.openai_model,
         )
-
-        if st.button("Save Configuration", type="primary"):
+        gemini_key = st.text_input(
+            "Gemini API Key",
+            value=config.gemini_key,
+            type="password",
+        )
+        gemini_model = st.text_input(
+            "Gemini Model",
+            value=config.gemini_model,
+        )
+        if st.button("💾 Save Configuration", use_container_width=True):
             new_config = AppConfig(
                 slack_token=slack_token.strip(),
                 gemini_key=gemini_key.strip(),
@@ -143,26 +273,6 @@ def main() -> None:
             )
             save_config(store, new_config)
             st.success("Configuration saved.")
-
-    st.subheader("Incremental Export")
-    if st.button(
-        "Run Incremental Export",
-        disabled=st.session_state.get("is_exporting", False),
-    ):
-        trigger_pipeline(store)
-
-    st.subheader("Manual Export (Custom Range)")
-    today = date.today()
-    default_start = today
-    start_date = st.date_input("Start Date", value=default_start)
-    end_date = st.date_input("End Date", value=today)
-    if st.button(
-        "Run Manual Export",
-        disabled=st.session_state.get("is_exporting", False),
-    ):
-        start_dt = combine_date(start_date, end_of_day=False)
-        end_dt = combine_date(end_date, end_of_day=True)
-        trigger_pipeline(store, start_dt=start_dt, end_dt=end_dt)
 
     status = st.session_state.get("status_message")
     if status:
@@ -182,10 +292,7 @@ def main() -> None:
             )
         else:
             st.caption("No exported files found to download yet.")
-        st.metric("Threads Exported", last_result.get("threads_exported", 0))
-        st.metric("LLM Summaries", last_result.get("summaries_generated", 0))
-        st.metric("Transcript Fallbacks", last_result.get("summaries_fallback", 0))
-        st.metric("Embedding Chunks", last_result.get("embedding_records", 0))
+        render_metrics(last_result)
         provider_stats = last_result.get("summary_providers") or {}
         if provider_stats:
             with st.expander("Summary providers breakdown"):
