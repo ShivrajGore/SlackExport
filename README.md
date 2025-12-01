@@ -51,6 +51,7 @@ streamlit run streamlit_app.py
 Features:
 
 - Manage Slack token, Gemini API key, monitored channels, output directory, and model selection.
+- (Optional) Provide an OpenAI API key/model; OpenAI runs first, Gemini acts as a secondary fallback.
 - Trigger incremental exports or manual exports constrained by custom date ranges.
 - View the locally persisted execution logs (`.data/logs.json`).
 
@@ -63,3 +64,5 @@ Each exported thread yields a Markdown file with three sections:
 3. **Findings & Lessons Learned**
 
 File names are derived from the channel ID and root timestamp, ensuring unique, easily traceable entries inside `knowledge_base/`.
+
+Each Markdown file now embeds both the structured summary and the full conversation transcript. A parallel JSONL file (`knowledge_base/embeddings/threads.jsonl`) captures embedding-friendly text chunks (issue, resolution, findings, and an excerpt) for indexing in custom GPT or vector databases.

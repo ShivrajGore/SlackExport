@@ -11,6 +11,7 @@ from typing import Iterable, List, Optional, Sequence
 from dateutil import parser as date_parser
 
 import google.generativeai as genai
+import openai
 from google.api_core import exceptions as google_exceptions
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
@@ -57,6 +58,46 @@ def _normalize_response_field(value) -> str:
         joined = "\n".join(part for part in parts if part)
         return joined.strip()
     return str(value).strip()
+
+
+def _extract_sections(payload: dict) -> tuple[str, str, str, List[str]]:
+    issue = _normalize_response_field(
+        payload.get("issue_description") or payload.get("issue")
+    )
+    resolution = _normalize_response_field(
+        payload.get("resolution_fix") or payload.get("resolution")
+    )
+    findings = _normalize_response_field(
+        payload.get("findings_lessons") or payload.get("findings")
+    )
+    issue = "" if issue.lower() in PLACEHOLDER_RESPONSES else issue
+    resolution = "" if resolution.lower() in PLACEHOLDER_RESPONSES else resolution
+    findings = "" if findings.lower() in PLACEHOLDER_RESPONSES else findings
+    missing_sections: List[str] = []
+    if not issue:
+        missing_sections.append("issue description")
+    if not resolution:
+        missing_sections.append("resolution/fix")
+    if not findings:
+        missing_sections.append("findings/lessons")
+    return issue, resolution, findings, missing_sections
+
+
+def _build_prompt(thread: SlackThread, missing_sections: Optional[List[str]] = None) -> str:
+    reminder = ""
+    if missing_sections:
+        missing_text = ", ".join(missing_sections)
+        reminder = (
+            "\n\nPrevious response omitted required sections. "
+            f"Ensure the following sections contain actionable content: {missing_text}. "
+            "Summarize concisely even if the thread is sparse."
+        )
+    return (
+        "Respond with ONLY valid minified JSON (no code fences, no commentary).\n"
+        f"Slack thread from channel {thread.channel_id}:\n"
+        f"{thread.as_prompt_block()}"
+        f"{reminder}"
+    )
 
 
 class SlackExtractor:
@@ -200,33 +241,12 @@ class GeminiTransformer:
         self.model = genai.GenerativeModel(model_name)
         self.max_attempts = max(1, max_attempts)
 
-    def _build_prompt(
-        self, thread: SlackThread, missing_sections: Optional[List[str]] = None
-    ) -> str:
-        reminder = ""
-        if missing_sections:
-            missing_text = ", ".join(missing_sections)
-            reminder = (
-                "\n\nPrevious response omitted required sections. "
-                f"Ensure the following sections contain actionable content: {missing_text}. "
-                "Summarize concisely even if the thread is sparse."
-            )
-        return (
-            f"{SYSTEM_PROMPT}\n\n"
-            "Respond with ONLY valid minified JSON (no code fences, no commentary).\n"
-            f"Slack thread from channel {thread.channel_id}:\n"
-            f"{thread.as_prompt_block()}"
-            f"{reminder}"
-        )
-
     def transform_thread(self, thread: SlackThread) -> KnowledgeEntry:
         pending_sections: List[str] = []
         last_error: Optional[str] = None
         last_payload: Optional[tuple[str, str, str]] = None
         for attempt in range(self.max_attempts):
-            user_prompt = self._build_prompt(
-                thread, missing_sections=pending_sections or None
-            )
+            user_prompt = f"{SYSTEM_PROMPT}\n\n{_build_prompt(thread, pending_sections or None)}"
             try:
                 response = self.model.generate_content(user_prompt)
             except google_exceptions.GoogleAPIError as exc:
@@ -243,25 +263,7 @@ class GeminiTransformer:
                 last_error = "Gemini response could not be parsed as JSON."
                 continue
 
-            issue = _normalize_response_field(
-                payload.get("issue_description") or payload.get("issue")
-            )
-            resolution = _normalize_response_field(
-                payload.get("resolution_fix") or payload.get("resolution")
-            )
-            findings = _normalize_response_field(
-                payload.get("findings_lessons") or payload.get("findings")
-            )
-            issue = "" if issue.lower() in PLACEHOLDER_RESPONSES else issue
-            resolution = "" if resolution.lower() in PLACEHOLDER_RESPONSES else resolution
-            findings = "" if findings.lower() in PLACEHOLDER_RESPONSES else findings
-            pending_sections = []
-            if not issue:
-                pending_sections.append("issue description")
-            if not resolution:
-                pending_sections.append("resolution/fix")
-            if not findings:
-                pending_sections.append("findings/lessons")
+            issue, resolution, findings, pending_sections = _extract_sections(payload)
             last_payload = (issue, resolution, findings)
             if pending_sections:
                 last_error = (
@@ -270,14 +272,14 @@ class GeminiTransformer:
                 )
                 continue
 
-            entry = KnowledgeEntry(
+            return KnowledgeEntry(
                 issue_description=issue.strip(),
                 resolution=resolution.strip(),
                 findings=findings.strip(),
                 source_channel=thread.channel_id,
                 source_ts=thread.root_ts,
+                summary_provider="gemini",
             )
-            return entry
 
         if last_payload:
             issue, resolution, findings = last_payload
@@ -286,14 +288,102 @@ class GeminiTransformer:
                 thread.root_ts,
                 ", ".join(pending_sections) if pending_sections else "unknown issue",
             )
-            return _transcript_fallback_entry(
+            entry = _transcript_fallback_entry(
                 thread,
                 issue=issue.strip(),
                 resolution=resolution.strip(),
                 findings=findings.strip(),
             )
+            entry.summary_provider = "gemini-transcript"
+            return entry
 
         raise RuntimeError(last_error or "Gemini transformation failed.")
+
+
+class ChatGPTTransformer:
+    """Calls OpenAI Chat Completions to transform a Slack thread."""
+
+    def __init__(self, api_key: str, model_name: str, max_attempts: int = 2) -> None:
+        if not api_key:
+            raise ValueError("OpenAI API key missing from configuration.")
+        self.client = openai.OpenAI(api_key=api_key)
+        self.model = model_name
+        self.max_attempts = max(1, max_attempts)
+
+    def transform_thread(self, thread: SlackThread) -> KnowledgeEntry:
+        pending_sections: List[str] = []
+        last_error: Optional[str] = None
+        last_payload: Optional[tuple[str, str, str]] = None
+        for attempt in range(self.max_attempts):
+            user_prompt = _build_prompt(thread, pending_sections or None)
+            try:
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    temperature=0,
+                )
+            except Exception as exc:  # pylint: disable=broad-except
+                last_error = str(exc)
+                continue
+
+            choice = response.choices[0].message
+            content = choice.content
+            if isinstance(content, list):
+                text = "".join(
+                    part.get("text", "")
+                    for part in content
+                    if isinstance(part, dict) and part.get("type") == "text"
+                )
+            else:
+                text = content or ""
+            text = text.strip()
+            if not text:
+                last_error = "OpenAI returned an empty response."
+                continue
+            try:
+                payload = json.loads(text)
+            except json.JSONDecodeError:
+                last_error = "OpenAI response could not be parsed as JSON."
+                continue
+
+            issue, resolution, findings, pending_sections = _extract_sections(payload)
+            last_payload = (issue, resolution, findings)
+            if pending_sections:
+                last_error = (
+                    "OpenAI response missing required fields: "
+                    f"{', '.join(pending_sections)}"
+                )
+                continue
+
+            return KnowledgeEntry(
+                issue_description=issue.strip(),
+                resolution=resolution.strip(),
+                findings=findings.strip(),
+                source_channel=thread.channel_id,
+                source_ts=thread.root_ts,
+                summary_provider="openai",
+            )
+
+        if last_payload:
+            issue, resolution, findings = last_payload
+            logger.warning(
+                "OpenAI summary incomplete for thread %s: %s. Falling back to transcript context.",
+                thread.root_ts,
+                ", ".join(pending_sections) if pending_sections else "unknown issue",
+            )
+            entry = _transcript_fallback_entry(
+                thread,
+                issue=issue.strip(),
+                resolution=resolution.strip(),
+                findings=findings.strip(),
+            )
+            entry.summary_provider = "openai-transcript"
+            return entry
+
+        raise RuntimeError(last_error or "OpenAI transformation failed.")
 
     @staticmethod
     def _extract_json_text(response) -> str:
@@ -371,8 +461,8 @@ def _validate_config(config: AppConfig) -> None:
     missing = []
     if not config.slack_token:
         missing.append("Slack token")
-    if not config.gemini_key:
-        missing.append("Gemini API key")
+    if not (config.gemini_key or config.openai_api_key):
+        missing.append("LLM API key (OpenAI or Gemini)")
     if not config.channel_ids:
         missing.append("channel IDs")
     if missing:
@@ -414,7 +504,23 @@ def run_pipeline(
         oldest = saved if saved is not None else 0.0
 
     extractor = SlackExtractor(config.slack_token)
-    transformer = GeminiTransformer(config.gemini_key, config.gemini_model)
+    transformers: List[tuple[str, object]] = []
+    if config.openai_api_key:
+        transformers.append(
+            (
+                "openai",
+                ChatGPTTransformer(
+                    config.openai_api_key, config.openai_model, max_attempts=2
+                ),
+            )
+        )
+    if config.gemini_key:
+        transformers.append(
+            (
+                "gemini",
+                GeminiTransformer(config.gemini_key, config.gemini_model, max_attempts=2),
+            )
+        )
     loader = KnowledgeBaseLoader(config.knowledge_base_dir)
     embeddings_path = (
         Path(config.knowledge_base_dir) / "embeddings" / "threads.jsonl"
@@ -429,6 +535,7 @@ def run_pipeline(
     summary_issues: List[str] = []
     channel_stats: dict[str, int] = {channel: 0 for channel in channels}
     embedding_records = 0
+    provider_stats: dict[str, int] = {}
 
     for channel_id in channels:
         try:
@@ -443,21 +550,41 @@ def run_pipeline(
             continue
         for thread in threads:
             fallback_used = False
-            try:
-                entry = transformer.transform_thread(thread)
-                summaries_generated += 1
-            except Exception as exc:  # pylint: disable=broad-except
+            entry: Optional[KnowledgeEntry] = None
+            provider_used: Optional[str] = None
+            provider_errors: List[str] = []
+            for provider_name, transformer in transformers:
+                try:
+                    entry = transformer.transform_thread(thread)
+                    provider_used = provider_name
+                    break
+                except Exception as exc:  # pylint: disable=broad-except
+                    error_msg = (
+                        f"Thread {thread.root_ts} {provider_name} summary failed: {exc}"
+                    )
+                    logger.warning(error_msg)
+                    provider_errors.append(error_msg)
+            if entry is None:
                 warning = (
-                    f"Thread {thread.root_ts} fell back to transcript summary due to: {exc}"
+                    f"Thread {thread.root_ts} fell back to transcript summary after "
+                    f"providers failed: {', '.join(name for name, _ in transformers)}"
                 )
                 logger.warning(warning)
                 summary_issues.append(warning)
+                summary_issues.extend(provider_errors)
                 entry = _transcript_fallback_entry(thread)
-                summaries_fallback += 1
                 fallback_used = True
-            entry.conversation = thread.as_prompt_block()
+                summaries_fallback += 1
+                provider_used = None
+            else:
+                summaries_generated += 1
+                summary_issues.extend(provider_errors)
+            entry.summary_provider = provider_used or "transcript"
+            entry.conversation = entry.conversation or thread.as_prompt_block()
             loader.save_entry(entry)
             exported += 1
+            provider_key = entry.summary_provider
+            provider_stats[provider_key] = provider_stats.get(provider_key, 0) + 1
             channel_stats[channel_id] = channel_stats.get(channel_id, 0) + 1
             embedding_writer.append(
                 {
@@ -465,6 +592,7 @@ def run_pipeline(
                     "channel_id": entry.source_channel,
                     "root_ts": entry.source_ts,
                     "fallback": fallback_used,
+                    "provider": entry.summary_provider,
                     "text": _build_embedding_text(entry, fallback=fallback_used),
                 }
             )
@@ -493,6 +621,7 @@ def run_pipeline(
         "channel_stats": channel_stats,
         "failures": failures,
         "summary_issues": summary_issues,
+        "summary_providers": provider_stats,
         "manual_range": manual_range,
         "start_timestamp": oldest,
         "end_timestamp": latest,

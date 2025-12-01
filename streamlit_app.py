@@ -109,6 +109,11 @@ def main() -> None:
             value=config.gemini_key,
             type="password",
         )
+        openai_key = st.text_input(
+            "OpenAI API Key",
+            value=config.openai_api_key,
+            type="password",
+        )
         channels_raw = st.text_area(
             "Channel IDs (one per line)",
             value="\n".join(config.channel_ids),
@@ -121,14 +126,20 @@ def main() -> None:
             "Gemini Model",
             value=config.gemini_model,
         )
+        openai_model = st.text_input(
+            "OpenAI Model",
+            value=config.openai_model,
+        )
 
         if st.button("Save Configuration", type="primary"):
             new_config = AppConfig(
                 slack_token=slack_token.strip(),
                 gemini_key=gemini_key.strip(),
+                openai_api_key=openai_key.strip(),
                 channel_ids=parse_channels(channels_raw),
                 knowledge_base_dir=knowledge_dir.strip() or "knowledge_base",
                 gemini_model=gemini_model.strip() or config.gemini_model,
+                openai_model=openai_model.strip() or config.openai_model,
             )
             save_config(store, new_config)
             st.success("Configuration saved.")
@@ -175,9 +186,13 @@ def main() -> None:
         st.metric("LLM Summaries", last_result.get("summaries_generated", 0))
         st.metric("Transcript Fallbacks", last_result.get("summaries_fallback", 0))
         st.metric("Embedding Chunks", last_result.get("embedding_records", 0))
+        provider_stats = last_result.get("summary_providers") or {}
+        if provider_stats:
+            with st.expander("Summary providers breakdown"):
+                st.write(provider_stats)
         summary_issues = last_result.get("summary_issues") or []
         if summary_issues:
-            with st.expander("Summaries that fell back to raw transcript"):
+            with st.expander("Summary issues (fallbacks and provider errors)"):
                 for issue in summary_issues:
                     st.write(f"- {issue}")
 
