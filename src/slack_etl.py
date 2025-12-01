@@ -179,10 +179,8 @@ class SlackExtractor:
             }
             if cursor:
                 params["cursor"] = cursor
-            if oldest is not None:
-                params["oldest"] = _format_timestamp(oldest)
-            if latest is not None:
-                params["latest"] = _format_timestamp(latest)
+            # Do not pass oldest/latest to ensure we capture the full thread
+            # even if replies occur outside the requested window.
             try:
                 response = self.client.conversations_replies(**params)
             except SlackApiError as exc:
