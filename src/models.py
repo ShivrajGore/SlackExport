@@ -15,7 +15,7 @@ class AppConfig:
     channel_ids: List[str] = field(default_factory=list)
     openai_api_key: str = ""
     knowledge_base_dir: str = "knowledge_base"
-    gemini_model: str = "gemini-1.5-pro-latest"
+    gemini_model: str = "gemini-2.5-flash"
     openai_model: str = "gpt-4o-mini"
 
     @classmethod
@@ -26,7 +26,7 @@ class AppConfig:
             openai_api_key=data.get("openaiApiKey", ""),
             channel_ids=data.get("channelIds", []) or [],
             knowledge_base_dir=data.get("knowledgeBaseDir", "knowledge_base"),
-            gemini_model=data.get("geminiModel", "gemini-1.5-pro-latest"),
+            gemini_model=data.get("geminiModel", "gemini-2.5-flash"),
             openai_model=data.get("openaiModel", "gpt-4o-mini"),
         )
 

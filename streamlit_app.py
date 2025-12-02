@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import json
+import zipfile
 from datetime import date, datetime, time as dt_time, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
 from typing import List, Optional, Tuple
-import zipfile
 
 import streamlit as st
 
@@ -126,6 +127,9 @@ def trigger_pipeline(store: FirestoreStore, start_dt=None, end_dt=None) -> None:
     with st.spinner("Running export..."):
         try:
             result = run_pipeline(store, start_time=start_dt, end_time=end_dt)
+            result["selected_files"] = None
+            result["selected_records"] = None
+            result["export_type"] = "batch"
             st.session_state.last_result = result
             st.session_state.status_message = (
                 "success",
@@ -158,10 +162,30 @@ def trigger_single_thread(store: FirestoreStore, permalink: str) -> None:
     st.session_state.is_exporting = True
     with st.spinner("Exporting thread..."):
         try:
-            path = export_single_thread(config, permalink)
+            entry, record = export_single_thread(config, permalink)
+            ts_value = float(entry.source_ts)
+            fallback_used = entry.summary_provider.endswith("transcript")
+            result = {
+                "threads_exported": 1,
+                "summaries_generated": 0 if fallback_used else 1,
+                "summaries_fallback": 1 if fallback_used else 0,
+                "embedding_records": 1,
+                "channel_stats": {entry.source_channel: 1},
+                "failures": [],
+                "summary_issues": [],
+                "summary_providers": {entry.summary_provider: 1},
+                "manual_range": True,
+                "start_timestamp": ts_value,
+                "end_timestamp": ts_value + 0.000001,
+                "output_dir": config.knowledge_base_dir,
+                "selected_files": [str(entry.file_path)] if entry.file_path else None,
+                "selected_records": [record],
+                "export_type": "single",
+            }
+            st.session_state.last_result = result
             st.session_state.status_message = (
                 "success",
-                f"Thread exported to {path}",
+                f"Thread exported to {entry.file_path}",
             )
         except Exception as exc:  # pylint: disable=broad-except
             st.session_state.status_message = ("error", str(exc))
@@ -169,20 +193,103 @@ def trigger_single_thread(store: FirestoreStore, permalink: str) -> None:
             st.session_state.is_exporting = False
 
 
-def build_download_bundle(output_dir: str) -> Optional[Tuple[bytes, str]]:
+def _normalize_ts(value) -> Optional[float]:
+    try:
+        if value is None:
+            return None
+        num = float(value)
+    except (TypeError, ValueError):
+        return None
+    if num <= 0:
+        return None
+    return num
+
+
+def format_range_label(
+    start_ts: Optional[float],
+    end_ts: Optional[float],
+    manual_range: bool,
+) -> str:
+    tz = LOCAL_TZ or datetime.now().astimezone().tzinfo
+    start = _normalize_ts(start_ts)
+    end = _normalize_ts(end_ts)
+    if start and end:
+        start_label = datetime.fromtimestamp(start, tz).strftime("%Y%m%d")
+        end_adjusted = end - 1 if end - 1 > 0 else end
+        end_label = datetime.fromtimestamp(end_adjusted, tz).strftime("%Y%m%d")
+        label = start_label if start_label == end_label else f"{start_label}-{end_label}"
+    elif start:
+        label = datetime.fromtimestamp(start, tz).strftime("%Y%m%d")
+    else:
+        label = datetime.now(tz).strftime("%Y%m%d")
+    return label
+
+
+def build_download_bundle(
+    output_dir: str,
+    range_label: str,
+    selected_files: Optional[List[str]] = None,
+) -> Optional[Tuple[bytes, str]]:
     base_path = Path(output_dir)
     if not base_path.exists():
         return None
-    files = [path for path in base_path.rglob("*") if path.is_file()]
+    if selected_files:
+        files = [Path(item) for item in selected_files if Path(item).exists()]
+        base_for_rel = base_path
+    else:
+        files = [path for path in base_path.rglob("*") if path.is_file()]
+        base_for_rel = base_path
     if not files:
         return None
     buffer = BytesIO()
     with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for file_path in files:
-            archive.write(file_path, arcname=str(file_path.relative_to(base_path)))
+            try:
+                arcname = file_path.relative_to(base_for_rel)
+            except ValueError:
+                arcname = file_path.name
+            archive.write(file_path, arcname=str(arcname))
     buffer.seek(0)
-    filename = f"slack_export_{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}.zip"
+    filename = f"threads_{range_label}.zip"
     return buffer.getvalue(), filename
+
+
+def build_embeddings_payload(
+    output_dir: str,
+    start_ts: Optional[float],
+    end_ts: Optional[float],
+    range_label: str,
+    selected_records: Optional[List[dict]] = None,
+) -> Optional[Tuple[bytes, str]]:
+    start = _normalize_ts(start_ts)
+    end = _normalize_ts(end_ts)
+    lines: List[str] = []
+    if selected_records:
+        lines = [json.dumps(record, ensure_ascii=False) for record in selected_records]
+    else:
+        embeddings_path = Path(output_dir) / "embeddings" / "threads.jsonl"
+        if not embeddings_path.exists():
+            return None
+        with embeddings_path.open("r", encoding="utf-8") as handle:
+            for raw_line in handle:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                ts_value = _normalize_ts(record.get("root_ts"))
+                if start is not None and (ts_value is None or ts_value < start):
+                    continue
+                if end is not None and (ts_value is None or ts_value >= end):
+                    continue
+                lines.append(json.dumps(record, ensure_ascii=False))
+    if not lines:
+        return None
+    payload = "\n".join(lines).encode("utf-8")
+    filename = f"threads_{range_label}.jsonl"
+    return payload, filename
 
 
 def render_metrics(last_result: dict) -> None:
@@ -204,6 +311,51 @@ def render_metrics(last_result: dict) -> None:
                 """,
                 unsafe_allow_html=True,
             )
+
+
+def render_downloads(last_result: dict) -> None:
+    output_dir = last_result.get("output_dir")
+    if not output_dir:
+        st.caption("No export directory available for download.")
+        return
+    range_label = format_range_label(
+        last_result.get("start_timestamp"),
+        last_result.get("end_timestamp"),
+        last_result.get("manual_range", False),
+    )
+    selected_files = last_result.get("selected_files")
+    selected_records = last_result.get("selected_records")
+    bundle = build_download_bundle(output_dir, range_label, selected_files=selected_files)
+    embeddings_payload = build_embeddings_payload(
+        output_dir,
+        last_result.get("start_timestamp"),
+        last_result.get("end_timestamp"),
+        range_label,
+        selected_records=selected_records,
+    )
+    col_zip, col_json = st.columns(2)
+    with col_zip:
+        if bundle:
+            data, filename = bundle
+            st.download_button(
+                "⬇️ Download Threads (.zip)",
+                data=data,
+                file_name=filename,
+                mime="application/zip",
+            )
+        else:
+            st.caption("No thread files available for download.")
+    with col_json:
+        if embeddings_payload:
+            data, filename = embeddings_payload
+            st.download_button(
+                "⬇️ Download Embeddings (.jsonl)",
+                data=data,
+                file_name=filename,
+                mime="application/json",
+            )
+        else:
+            st.caption("No embedding records found for this export.")
 
 
 def main() -> None:
@@ -316,18 +468,8 @@ def main() -> None:
     if st.session_state.get("last_result"):
         last_result = st.session_state["last_result"]
         st.json(last_result)
-        bundle = build_download_bundle(last_result["output_dir"])
-        if bundle:
-            content, filename = bundle
-            st.download_button(
-                "Download Exported Threads",
-                data=content,
-                file_name=filename,
-                mime="application/zip",
-            )
-        else:
-            st.caption("No exported files found to download yet.")
         render_metrics(last_result)
+        render_downloads(last_result)
         provider_stats = last_result.get("summary_providers") or {}
         if provider_stats:
             with st.expander("Summary providers breakdown"):

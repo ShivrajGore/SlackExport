@@ -2,16 +2,19 @@ from __future__ import annotations
 
 import argparse
 import re
+from pathlib import Path
 from typing import List, Optional
 
 from slack_sdk import WebClient
 
+from .embedding_store import EmbeddingWriter
 from .firestore_store import FirestoreStore
 from .models import AppConfig, KnowledgeEntry, SlackMessage, SlackThread
 from .slack_etl import (
     ChatGPTTransformer,
     GeminiTransformer,
     KnowledgeBaseLoader,
+    _build_embedding_text,
     _transcript_fallback_entry,
 )
 
@@ -89,7 +92,7 @@ def transform_thread(
     return entry
 
 
-def export_single_thread(config: AppConfig, permalink: str) -> str:
+def export_single_thread(config: AppConfig, permalink: str) -> tuple[KnowledgeEntry, dict]:
     channel_id, root_ts = parse_permalink(permalink)
     client = WebClient(token=config.slack_token)
     cursor: Optional[str] = None
@@ -110,8 +113,22 @@ def export_single_thread(config: AppConfig, permalink: str) -> str:
     entry = transform_thread(transformers, thread)
     entry.conversation = thread.as_prompt_block()
     loader = KnowledgeBaseLoader(config.knowledge_base_dir)
-    saved = loader.save_entry(entry)
-    return str(saved)
+    loader.save_entry(entry)
+    fallback_used = entry.summary_provider.endswith("transcript")
+    record = {
+        "id": f"{entry.source_channel}-{entry.source_ts}",
+        "channel_id": entry.source_channel,
+        "root_ts": entry.source_ts,
+        "fallback": fallback_used,
+        "provider": entry.summary_provider,
+        "text": _build_embedding_text(entry, fallback=fallback_used),
+    }
+    embeddings_path = (
+        Path(config.knowledge_base_dir) / "embeddings" / "threads.jsonl"
+    )
+    writer = EmbeddingWriter(embeddings_path)
+    writer.append(record)
+    return entry, record
 
 
 def main() -> None:
@@ -123,8 +140,8 @@ def main() -> None:
 
     store = FirestoreStore()
     config = store.fetch_config()
-    path = export_single_thread(config, args.permalink)
-    print(f"Thread exported to {path}")
+    entry, _ = export_single_thread(config, args.permalink)
+    print(f"Thread exported to {entry.file_path}")
 
 
 if __name__ == "__main__":
