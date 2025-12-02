@@ -66,3 +66,13 @@ Each exported thread yields a Markdown file with three sections:
 File names are derived from the channel ID and root timestamp, ensuring unique, easily traceable entries inside `knowledge_base/`.
 
 Each Markdown file now embeds both the structured summary and the full conversation transcript. A parallel JSONL file (`knowledge_base/embeddings/threads.jsonl`) captures embedding-friendly text chunks (issue, resolution, findings, and an excerpt) for indexing in custom GPT or vector databases.
+
+### Exporting a Single Thread by Permalink
+
+When you only need one thread, run:
+
+```bash
+python -m src.slack_single_export "https://yourworkspace.slack.com/archives/C01ABCD/p1717023456000123"
+```
+
+The CLI parses the permalink, fetches the full conversation, and writes the Markdown/embedding entry using the same OpenAI→Gemini→transcript fallback chain.

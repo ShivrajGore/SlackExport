@@ -11,6 +11,7 @@ import streamlit as st
 from src.firestore_store import FirestoreStore
 from src.models import AppConfig
 from src.slack_etl import run_pipeline
+from src.slack_single_export import export_single_thread
 
 st.set_page_config(
     page_title="Slack Knowledge Export",
@@ -50,9 +51,12 @@ def inject_theme() -> None:
                 color: white;
                 border: none;
                 border-radius: 999px;
-                padding: 0.6rem 1.4rem;
+                padding: 0.45rem 1.2rem;
                 font-weight: 600;
                 box-shadow: 0 10px 25px rgba(92,108,255,0.3);
+                width: auto;
+                min-width: 200px;
+                max-width: 320px;
             }}
             .stButton>button:disabled {{
                 background: rgba(255,255,255,0.1);
@@ -145,6 +149,26 @@ def render_logs(store: FirestoreStore) -> None:
     st.dataframe(logs, use_container_width=True)
 
 
+def trigger_single_thread(store: FirestoreStore, permalink: str) -> None:
+    permalink = permalink.strip()
+    if not permalink:
+        st.warning("Enter a Slack thread permalink first.")
+        return
+    config: AppConfig = st.session_state.get("config") or store.fetch_config()
+    st.session_state.is_exporting = True
+    with st.spinner("Exporting thread..."):
+        try:
+            path = export_single_thread(config, permalink)
+            st.session_state.status_message = (
+                "success",
+                f"Thread exported to {path}",
+            )
+        except Exception as exc:  # pylint: disable=broad-except
+            st.session_state.status_message = ("error", str(exc))
+        finally:
+            st.session_state.is_exporting = False
+
+
 def build_download_bundle(output_dir: str) -> Optional[Tuple[bytes, str]]:
     base_path = Path(output_dir)
     if not base_path.exists():
@@ -207,7 +231,6 @@ def main() -> None:
         with col1:
             if st.button(
                 "⚡ Run Incremental Export",
-                use_container_width=True,
                 disabled=st.session_state.get("is_exporting", False),
             ):
                 trigger_pipeline(store)
@@ -218,12 +241,24 @@ def main() -> None:
             end_date = st.date_input("End Date", value=today)
             if st.button(
                 "📅 Run Manual Export",
-                use_container_width=True,
                 disabled=st.session_state.get("is_exporting", False),
             ):
                 start_dt = combine_date(start_date, end_of_day=False)
                 end_dt = combine_date(end_date, end_of_day=True)
                 trigger_pipeline(store, start_dt=start_dt, end_dt=end_dt)
+        st.divider()
+        col_link, col_link_btn = st.columns([3, 1])
+        with col_link:
+            permalink = st.text_input(
+                "Paste a Slack thread permalink",
+                placeholder="https://yourworkspace.slack.com/archives/…",
+            )
+        with col_link_btn:
+            if st.button(
+                "🎯 Export Thread",
+                disabled=st.session_state.get("is_exporting", False),
+            ):
+                trigger_single_thread(store, permalink)
         st.markdown("</div>", unsafe_allow_html=True)
 
     with st.expander("Configuration", expanded=False):
