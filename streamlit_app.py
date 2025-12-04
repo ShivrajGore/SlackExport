@@ -124,9 +124,24 @@ def combine_date(date_value: date, end_of_day: bool = False) -> datetime:
 
 def trigger_pipeline(store: FirestoreStore, start_dt=None, end_dt=None) -> None:
     st.session_state.is_exporting = True
+    progress_container = st.empty()
+    progress_bar = progress_container.progress(0, text="Preparing export...")
+
+    def update_progress(current: int, total: int) -> None:
+        if total <= 0:
+            progress_bar.progress(0, text="Preparing export...")
+            return
+        percent = min(100, max(0, int((current / total) * 100)))
+        progress_bar.progress(percent, text=f"Processing chunk {current}/{total}")
+
     with st.spinner("Running export..."):
         try:
-            result = run_pipeline(store, start_time=start_dt, end_time=end_dt)
+            result = run_pipeline(
+                store,
+                start_time=start_dt,
+                end_time=end_dt,
+                progress_callback=update_progress,
+            )
             result["selected_files"] = None
             result["selected_records"] = None
             result["export_type"] = "batch"
@@ -142,6 +157,7 @@ def trigger_pipeline(store: FirestoreStore, start_dt=None, end_dt=None) -> None:
         except Exception as exc:  # pylint: disable=broad-except
             st.session_state.status_message = ("error", str(exc))
         finally:
+            progress_container.empty()
             st.session_state.is_exporting = False
 
 

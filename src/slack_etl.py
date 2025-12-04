@@ -4,9 +4,9 @@ import argparse
 import json
 import logging
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Iterable, List, Optional, Sequence
+from typing import Callable, Iterable, List, Optional, Sequence, Tuple
 
 from dateutil import parser as date_parser
 
@@ -475,6 +475,23 @@ def _to_epoch(value: Optional[datetime]) -> Optional[float]:
     return value.timestamp()
 
 
+def _chunk_range(
+    oldest: Optional[float], latest: Optional[float], max_days: int = 3
+) -> List[Tuple[Optional[float], Optional[float]]]:
+    if oldest is None or latest is None or latest <= oldest:
+        return [(oldest, latest)]
+    chunks: List[Tuple[Optional[float], Optional[float]]] = []
+    start = datetime.fromtimestamp(oldest, tz=timezone.utc)
+    end = datetime.fromtimestamp(latest, tz=timezone.utc)
+    cursor = start
+    delta = timedelta(days=max_days)
+    while cursor < end:
+        next_cursor = min(cursor + delta, end)
+        chunks.append((cursor.timestamp(), next_cursor.timestamp()))
+        cursor = next_cursor
+    return chunks
+
+
 def run_pipeline(
     store: FirestoreStore,
     start_time: Optional[datetime] = None,
@@ -534,67 +551,85 @@ def run_pipeline(
     channel_stats: dict[str, int] = {channel: 0 for channel in channels}
     embedding_records = 0
     provider_stats: dict[str, int] = {}
+    chunk_ranges = (
+        _chunk_range(oldest, latest, max_days=3)
+        if manual_range and oldest is not None and latest is not None
+        else [(oldest, latest)]
+    )
+    total_chunks = len(chunk_ranges)
 
-    for channel_id in channels:
-        try:
-            threads = extractor.fetch_threads(channel_id, oldest=oldest, latest=latest)
-        except Exception as exc:  # pylint: disable=broad-except
-            failure = f"Channel {channel_id} extraction failed: {exc}"
-            logger.exception(failure)
-            failures.append(failure)
-            continue
-        if not threads:
-            logger.info("No new threads for channel %s", channel_id)
-            continue
-        for thread in threads:
-            fallback_used = False
-            entry: Optional[KnowledgeEntry] = None
-            provider_used: Optional[str] = None
-            provider_errors: List[str] = []
-            for provider_name, transformer in transformers:
-                try:
-                    entry = transformer.transform_thread(thread)
-                    provider_used = provider_name
-                    break
-                except Exception as exc:  # pylint: disable=broad-except
-                    error_msg = (
-                        f"Thread {thread.root_ts} {provider_name} summary failed: {exc}"
-                    )
-                    logger.warning(error_msg)
-                    provider_errors.append(error_msg)
-            if entry is None:
-                warning = (
-                    f"Thread {thread.root_ts} fell back to transcript summary after "
-                    f"providers failed: {', '.join(name for name, _ in transformers)}"
+    for chunk_index, (chunk_oldest, chunk_latest) in enumerate(
+        chunk_ranges, start=1
+    ):
+        for channel_id in channels:
+            try:
+                threads = extractor.fetch_threads(
+                    channel_id, oldest=chunk_oldest, latest=chunk_latest
                 )
-                logger.warning(warning)
-                summary_issues.append(warning)
-                summary_issues.extend(provider_errors)
-                entry = _transcript_fallback_entry(thread)
-                fallback_used = True
-                summaries_fallback += 1
-                provider_used = None
-            else:
-                summaries_generated += 1
-                summary_issues.extend(provider_errors)
-            entry.summary_provider = provider_used or "transcript"
-            entry.conversation = entry.conversation or thread.as_prompt_block()
-            loader.save_entry(entry)
-            exported += 1
-            provider_key = entry.summary_provider
-            provider_stats[provider_key] = provider_stats.get(provider_key, 0) + 1
-            channel_stats[channel_id] = channel_stats.get(channel_id, 0) + 1
-            embedding_writer.append(
-                {
-                    "id": f"{entry.source_channel}-{entry.source_ts}",
-                    "channel_id": entry.source_channel,
-                    "root_ts": entry.source_ts,
-                    "fallback": fallback_used,
-                    "provider": entry.summary_provider,
-                    "text": _build_embedding_text(entry, fallback=fallback_used),
-                }
-            )
-            embedding_records += 1
+            except Exception as exc:  # pylint: disable=broad-except
+                failure = f"Channel {channel_id} extraction failed: {exc}"
+                logger.exception(failure)
+                failures.append(failure)
+                continue
+            if not threads:
+                logger.info(
+                    "No new threads for channel %s in chunk %s/%s",
+                    channel_id,
+                    chunk_index,
+                    total_chunks,
+                )
+                continue
+            for thread in threads:
+                fallback_used = False
+                entry: Optional[KnowledgeEntry] = None
+                provider_used: Optional[str] = None
+                provider_errors: List[str] = []
+                for provider_name, transformer in transformers:
+                    try:
+                        entry = transformer.transform_thread(thread)
+                        provider_used = provider_name
+                        break
+                    except Exception as exc:  # pylint: disable=broad-except
+                        error_msg = (
+                            f"Thread {thread.root_ts} {provider_name} summary failed: {exc}"
+                        )
+                        logger.warning(error_msg)
+                        provider_errors.append(error_msg)
+                if entry is None:
+                    warning = (
+                        f"Thread {thread.root_ts} fell back to transcript summary after "
+                        f"providers failed: {', '.join(name for name, _ in transformers)}"
+                    )
+                    logger.warning(warning)
+                    summary_issues.append(warning)
+                    summary_issues.extend(provider_errors)
+                    entry = _transcript_fallback_entry(thread)
+                    fallback_used = True
+                    summaries_fallback += 1
+                    provider_used = None
+                else:
+                    summaries_generated += 1
+                    summary_issues.extend(provider_errors)
+                entry.summary_provider = provider_used or "transcript"
+                entry.conversation = entry.conversation or thread.as_prompt_block()
+                loader.save_entry(entry)
+                exported += 1
+                provider_key = entry.summary_provider
+                provider_stats[provider_key] = provider_stats.get(provider_key, 0) + 1
+                channel_stats[channel_id] = channel_stats.get(channel_id, 0) + 1
+                embedding_writer.append(
+                    {
+                        "id": f"{entry.source_channel}-{entry.source_ts}",
+                        "channel_id": entry.source_channel,
+                        "root_ts": entry.source_ts,
+                        "fallback": fallback_used,
+                        "provider": entry.summary_provider,
+                        "text": _build_embedding_text(entry, fallback=fallback_used),
+                    }
+                )
+                embedding_records += 1
+        if progress_callback:
+            progress_callback(chunk_index, total_chunks)
 
     if not manual_range and not failures:
         store.update_last_run(time.time())
@@ -621,8 +656,8 @@ def run_pipeline(
         "summary_issues": summary_issues,
         "summary_providers": provider_stats,
         "manual_range": manual_range,
-        "start_timestamp": oldest,
-        "end_timestamp": latest,
+        "start_timestamp": chunk_ranges[0][0] if chunk_ranges else oldest,
+        "end_timestamp": chunk_ranges[-1][1] if chunk_ranges else latest,
         "output_dir": str(loader.output_dir.resolve()),
     }
 
