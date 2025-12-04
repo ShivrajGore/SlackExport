@@ -497,6 +497,7 @@ def run_pipeline(
     start_time: Optional[datetime] = None,
     end_time: Optional[datetime] = None,
     channel_filter: Optional[Sequence[str]] = None,
+    progress_callback: Optional[Callable[[int, int], None]] = None,
 ) -> dict:
     """
     Execute the ETL pipeline.
