@@ -342,7 +342,16 @@ class ChatGPTTransformer:
                     temperature=0,
                 )
             except Exception as exc:  # pylint: disable=broad-except
-                last_error = str(exc)
+                error_message = str(exc)
+                last_error = error_message
+                lowered = error_message.lower()
+                if "rate limit" in lowered or "429" in lowered:
+                    wait_time = 25
+                    logger.warning(
+                        "OpenAI rate limit encountered; sleeping for %s seconds before retrying.",
+                        wait_time,
+                    )
+                    time.sleep(wait_time)
                 continue
 
             choice = response.choices[0].message
@@ -460,6 +469,16 @@ def _validate_config(config: AppConfig) -> None:
         missing.append("Slack token")
     if not (config.gemini_key or config.openai_api_key):
         missing.append("LLM API key (OpenAI or Gemini)")
+    if not config.channel_ids:
+        missing.append("channel IDs")
+    if missing:
+        raise ValueError(f"Missing configuration: {', '.join(missing)}")
+
+
+def _validate_raw_config(config: AppConfig) -> None:
+    missing = []
+    if not config.slack_token:
+        missing.append("Slack token")
     if not config.channel_ids:
         missing.append("channel IDs")
     if missing:
@@ -659,6 +678,112 @@ def run_pipeline(
         "start_timestamp": chunk_ranges[0][0] if chunk_ranges else oldest,
         "end_timestamp": chunk_ranges[-1][1] if chunk_ranges else latest,
         "output_dir": str(loader.output_dir.resolve()),
+    }
+
+
+def run_raw_export(
+    store: FirestoreStore,
+    start_time: Optional[datetime] = None,
+    end_time: Optional[datetime] = None,
+    channel_filter: Optional[Sequence[str]] = None,
+    progress_callback: Optional[Callable[[int, int], None]] = None,
+) -> dict:
+    config = store.fetch_config()
+    _validate_raw_config(config)
+
+    oldest = _to_epoch(start_time)
+    latest = _to_epoch(end_time)
+    manual_range = start_time is not None or end_time is not None
+    if oldest is None:
+        saved = store.fetch_last_run_ts()
+        oldest = saved if saved is not None else 0.0
+
+    extractor = SlackExtractor(config.slack_token)
+    loader = KnowledgeBaseLoader(config.knowledge_base_dir)
+    embeddings_path = (
+        Path(config.knowledge_base_dir) / "embeddings" / "threads.jsonl"
+    )
+    embedding_writer = EmbeddingWriter(embeddings_path)
+
+    channels = list(channel_filter) if channel_filter else config.channel_ids
+    exported = 0
+    failures: List[str] = []
+    channel_stats: dict[str, int] = {channel: 0 for channel in channels}
+    embedding_records = 0
+    chunk_ranges = (
+        _chunk_range(oldest, latest, max_days=7)
+        if manual_range and oldest is not None and latest is not None
+        else [(oldest, latest)]
+    )
+    total_chunks = len(chunk_ranges)
+    saved_files: List[str] = []
+    saved_records: List[dict] = []
+
+    for chunk_index, (chunk_oldest, chunk_latest) in enumerate(
+        chunk_ranges, start=1
+    ):
+        for channel_id in channels:
+            try:
+                threads = extractor.fetch_threads(
+                    channel_id, oldest=chunk_oldest, latest=chunk_latest
+                )
+            except Exception as exc:  # pylint: disable=broad-except
+                failure = f"Channel {channel_id} extraction failed: {exc}"
+                logger.exception(failure)
+                failures.append(failure)
+                continue
+            if not threads:
+                logger.info(
+                    "No threads for channel %s in raw chunk %s/%s",
+                    channel_id,
+                    chunk_index,
+                    total_chunks,
+                )
+                continue
+            for thread in threads:
+                entry = _transcript_fallback_entry(thread)
+                entry.summary_provider = "transcript"
+                loader.save_entry(entry)
+                exported += 1
+                channel_stats[channel_id] = channel_stats.get(channel_id, 0) + 1
+                saved_files.append(str(entry.file_path))
+                record = {
+                    "id": f"{entry.source_channel}-{entry.source_ts}",
+                    "channel_id": entry.source_channel,
+                    "root_ts": entry.source_ts,
+                    "fallback": True,
+                    "provider": entry.summary_provider,
+                    "text": _build_embedding_text(entry, fallback=True),
+                }
+                embedding_writer.append(record)
+                embedding_records += 1
+                saved_records.append(record)
+        if progress_callback:
+            progress_callback(chunk_index, total_chunks)
+
+    details = (
+        f"RAW export | Channels: {', '.join(channels)} | "
+        f"Threads exported: {exported} | Errors: {len(failures)}"
+    )
+    status = "SUCCESS" if not failures else "FAILURE"
+    store.append_log(status=status, details=details)
+
+    return {
+        "channels_scanned": len(channels),
+        "threads_exported": exported,
+        "summaries_generated": 0,
+        "summaries_fallback": exported,
+        "embedding_records": embedding_records,
+        "channel_stats": channel_stats,
+        "failures": failures,
+        "summary_issues": failures,
+        "summary_providers": {"transcript": exported},
+        "manual_range": manual_range,
+        "start_timestamp": chunk_ranges[0][0] if chunk_ranges else oldest,
+        "end_timestamp": chunk_ranges[-1][1] if chunk_ranges else latest,
+        "output_dir": str(loader.output_dir.resolve()),
+        "exported_files": saved_files,
+        "exported_records": saved_records,
     }
 
 

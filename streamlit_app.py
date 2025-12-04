@@ -11,7 +11,7 @@ import streamlit as st
 
 from src.firestore_store import FirestoreStore
 from src.models import AppConfig
-from src.slack_etl import run_pipeline
+from src.slack_etl import run_pipeline, run_raw_export
 from src.slack_single_export import export_single_thread
 
 st.set_page_config(
@@ -374,6 +374,44 @@ def render_downloads(last_result: dict) -> None:
             st.caption("No embedding records found for this export.")
 
 
+def trigger_raw_export(store: FirestoreStore, start_dt=None, end_dt=None) -> None:
+    st.session_state.is_exporting = True
+    progress_container = st.empty()
+    progress_bar = progress_container.progress(0, text="Preparing export...")
+
+    def update_progress(current: int, total: int) -> None:
+        if total <= 0:
+            progress_bar.progress(0, text="Preparing export...")
+            return
+        percent = min(100, max(0, int((current / total) * 100)))
+        progress_bar.progress(percent, text=f"Exporting chunk {current}/{total}")
+
+    with st.spinner("Exporting original threads..."):
+        try:
+            result = run_raw_export(
+                store,
+                start_time=start_dt,
+                end_time=end_dt,
+                progress_callback=update_progress,
+            )
+            result["selected_files"] = result.pop("exported_files", None)
+            result["selected_records"] = result.pop("exported_records", None)
+            result["export_type"] = "raw"
+            st.session_state.last_result = result
+            st.session_state.status_message = (
+                "success",
+                (
+                    "Original thread export completed. "
+                    f"Threads exported: {result['threads_exported']}"
+                ),
+            )
+        except Exception as exc:  # pylint: disable=broad-except
+            st.session_state.status_message = ("error", str(exc))
+        finally:
+            progress_container.empty()
+            st.session_state.is_exporting = False
+
+
 def main() -> None:
     inject_theme()
     store = get_store()
@@ -407,13 +445,19 @@ def main() -> None:
             default_start = today
             start_date = st.date_input("Start Date", value=default_start)
             end_date = st.date_input("End Date", value=today)
+            start_dt = combine_date(start_date, end_of_day=False)
+            end_dt = combine_date(end_date, end_of_day=True)
             if st.button(
                 "📅 Run Manual Export",
                 disabled=st.session_state.get("is_exporting", False),
             ):
-                start_dt = combine_date(start_date, end_of_day=False)
-                end_dt = combine_date(end_date, end_of_day=True)
                 trigger_pipeline(store, start_dt=start_dt, end_dt=end_dt)
+            if st.button(
+                "🗂 Original Thread Export",
+                key="raw-export",
+                disabled=st.session_state.get("is_exporting", False),
+            ):
+                trigger_raw_export(store, start_dt=start_dt, end_dt=end_dt)
         st.divider()
         col_link, col_link_btn = st.columns([3, 1])
         with col_link:

@@ -52,6 +52,7 @@ Features:
 
 - Manage Slack token, Gemini API key, monitored channels, output directory, and model selection.
 - (Optional) Provide an OpenAI API key/model; OpenAI runs first, Gemini acts as a secondary fallback.
+- Trigger an **Original Thread Export** to dump raw Slack transcripts (no LLM calls) for long historical backfills.
 - Trigger incremental exports or manual exports constrained by custom date ranges.
 - View the locally persisted execution logs (`.data/logs.json`).
 
