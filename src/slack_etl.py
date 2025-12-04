@@ -297,6 +297,24 @@ class GeminiTransformer:
 
         raise RuntimeError(last_error or "Gemini transformation failed.")
 
+    @staticmethod
+    def _extract_json_text(response) -> str:
+        """Return raw JSON text, stripping common markdown fences."""
+        text = (response.text or "").strip()
+        if text.startswith("```"):
+            lines = text.splitlines()
+            # Remove opening fence
+            lines = lines[1:]
+            # Drop closing fence if present
+            if lines and lines[-1].strip().startswith("```"):
+                lines = lines[:-1]
+            text = "\n".join(lines).strip()
+
+        if "{" in text and "}" in text:
+            start = text.find("{")
+            end = text.rfind("}")
+            return text[start : end + 1]
+        return text
 
 class ChatGPTTransformer:
     """Calls OpenAI Chat Completions to transform a Slack thread."""
@@ -382,25 +400,6 @@ class ChatGPTTransformer:
             return entry
 
         raise RuntimeError(last_error or "OpenAI transformation failed.")
-
-    @staticmethod
-    def _extract_json_text(response) -> str:
-        """Return raw JSON text, stripping common markdown fences."""
-        text = (response.text or "").strip()
-        if text.startswith("```"):
-            lines = text.splitlines()
-            # Remove opening fence
-            lines = lines[1:]
-            # Drop closing fence if present
-            if lines and lines[-1].strip().startswith("```"):
-                lines = lines[:-1]
-            text = "\n".join(lines).strip()
-
-        if "{" in text and "}" in text:
-            start = text.find("{")
-            end = text.rfind("}")
-            return text[start : end + 1]
-        return text
 
 
 class KnowledgeBaseLoader:
